@@ -1,63 +1,76 @@
-from collections import defaultdict
-from fastapi import FastAPI, Header, HTTPException, status, Response
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List
+import time
+import uuid
+from datetime import datetime, timezone
+from collections import deque
+from fastapi import FastAPI, Query, Request, Response
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-ASSIGNED_API_KEY = "ak_j0kyu571rwfdtwy7vtp35btk"
-USER_EMAIL = "24f2007837@ds.study.iitm.ac.in"
+# Startup time tracking for uptime_s
+START_TIME = time.time()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Prometheus counter and log tail storage
+REQUEST_COUNT = 0
+LOG_BUFFER = deque(maxlen=1000)  # Store up to last 1000 logs
 
-class Event(BaseModel):
-    user: str
-    amount: float
-    ts: int
-
-class AnalyticsRequest(BaseModel):
-    events: List[Event]
-
-@app.post("/analytics")
-def compute_analytics(
-    payload: AnalyticsRequest, 
-    response: Response,
-    x_api_key: str = Header(None, alias="X-API-Key")
-):
-    # Strict 401 for missing or incorrect API key
-    if not x_api_key or x_api_key != ASSIGNED_API_KEY:
-        response.status_code = status.HTTP_401_UNAUTHORIZED
-        return {"error": "Unauthorized"}
+@app.middleware("http")
+async def instrumentation_middleware(request: Request, call_next):
+    global REQUEST_COUNT
+    REQUEST_COUNT += 1
     
-    events = payload.events
-    total_events = len(events)
+    start_time = time.time()
+    request_id = str(uuid.uuid4())
+    path = request.url.path
     
-    users_set = {e.user for e in events}
-    unique_users = len(users_set)
-    
-    total_revenue = 0.0
-    user_positive_totals = defaultdict(float)
-    
-    for e in events:
-        if e.amount > 0:
-            total_revenue += e.amount
-            user_positive_totals[e.user] += e.amount
+    # Process request
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+    except Exception as exc:
+        status_code = 500
+        raise exc
+    finally:
+        # Record structured log entry
+        log_entry = {
+            "level": "INFO" if status_code < 400 else "ERROR",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": path,
+            "request_id": request_id,
+            "status": status_code
+        }
+        LOG_BUFFER.append(log_entry)
+        
+    return response
 
-    top_user = ""
-    if user_positive_totals:
-        top_user = max(user_positive_totals, key=user_positive_totals.get)
-
+@app.get("/work")
+def do_work(n: int = Query(..., description="Units of work")):
+    # Simulate work
     return {
-        "email": USER_EMAIL,
-        "total_events": total_events,
-        "unique_users": unique_users,
-        "revenue": round(total_revenue, 4),
-        "top_user": top_user
+        "email": "24f2007837@ds.study.iitm.ac.in",
+        "done": n
     }
+
+@app.get("/metrics")
+def metrics():
+    # Prometheus text format exposure for http_requests_total
+    metrics_data = (
+        "# HELP http_requests_total Total number of HTTP requests.\n"
+        "# TYPE http_requests_total counter\n"
+        f"http_requests_total {REQUEST_COUNT}\n"
+    )
+    return Response(content=metrics_data, media_type="text/plain")
+
+@app.get("/healthz")
+def healthz():
+    uptime = time.time() - START_TIME
+    return {
+        "status": "ok",
+        "uptime_s": round(uptime, 4)
+    }
+
+@app.get("/logs/tail")
+def logs_tail(limit: int = Query(10, description="Number of recent logs to return")):
+    logs_list = list(LOG_BUFFER)
+    # Return the last N log entries
+    return logs_list[-limit:]
